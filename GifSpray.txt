@@ -1,0 +1,411 @@
+--@name GifSpray
+--@author Sparky & Ankalot
+--@shared
+
+-- Made by: Sparky
+-- Modified by: Ankalot
+
+-- press H to make a spray
+-- use up and down arrows to change spray size
+-- if spray is black just wait message "ready!" in chat or try another gif
+
+local spraySize = 10
+local dSize = 1
+local sprayMinSize = 1
+local mode = 0 -- if mode = 0 spray will be transparent (where needed), but visible only from one side
+               -- if mode = 1 spray background will be black, but visible from both sides
+local gifURL = "https://i.gifer.com/embedded/download/Adl8.gif"
+
+
+if SERVER then
+    sprayHolo = holograms.create(Vector(), Angle(), "models/holograms/plane.mdl", Vector(spraySize))
+    sprayHolo:suppressEngineLighting(true)
+    
+    net.receive("spray",function()
+        local orientation = net.readMatrix()
+        sprayHolo:setPos(orientation:getTranslation())
+        sprayHolo:setAngles(orientation:getAngles())
+        sprayHolo:setNoDraw(false)
+        sprayHolo:emitSound("player/sprayer.wav")
+    end)
+    
+    net.receive("getholo",function(len,pl)
+        net.start("holo") net.writeEntity(sprayHolo) net.send(pl)
+    end)
+    
+    net.receive("resetSize", function()
+        local spraySize = net.readInt(16)
+        sprayHolo:setScale(Vector(spraySize))
+    end)
+    
+else
+        local workers = {}
+    local function execWorker(worker)
+        local status
+        while quotaAverage()<quotaMax()*0.4 do
+            status = worker()
+            if status=="wait" or status=="done" then
+                break
+            end
+        end
+        return status
+    end
+    local function procWorkers()
+        local i = 1
+        while i <= #workers do
+            local status = execWorker(workers[i])
+            if status=="done" then
+                table.remove(workers, i)
+            elseif status=="wait" then
+                i = i + 1
+            else
+                break
+            end
+        end
+        if #workers==0 then hook.remove("think","gifworkers") end
+    end
+    local function addWorker(worker)
+        worker = coroutine.wrap(worker)
+        local status = execWorker(worker)
+        if status~="done" then
+            if #workers == 0 then hook.add("think", "gifworkers", procWorkers) end
+            workers[#workers+1] = worker
+        end
+    end
+    
+    -------------------------------------------------
+    
+    local gifdecoder = class("gifdecode")
+    local spritesheet = class("spritesheet")
+    
+    local function ignoreBlock(ss)
+        local size = ss:readUInt8()
+        while size>0 and ss:tell() <= ss:size() do
+            ss:skip(size)
+            size = ss:readUInt8()
+            coroutine.yield()
+        end
+    end
+    
+    local function readImg(ss, data)
+        local header = ss:read(10)
+        local lctflag = string.byte(header, 9, 9)
+        data[#data+1] = header
+        if bit.band(lctflag, 0x80) ~= 0 then
+            local lctsize = bit.lshift(1, bit.band(lctflag, 7) + 1)
+            data[#data+1] = ss:read(3 * lctsize)
+        end
+    
+        local size = ss:readUInt8()
+        while size>0 and ss:tell() <= ss:size() do
+            data[#data+1] = string.char(size)
+            data[#data+1] = ss:read(size)
+            size = ss:readUInt8()
+            coroutine.yield()
+        end
+        data[#data+1] = '\x00'
+    end
+    
+    local function imgStruct(header)
+        return {data = {header}, disposal = 0, delay = 0, transparency = false, transparencyi = 0}
+    end
+    
+    render.createRenderTarget("gif")
+    render.createRenderTarget("gifcanvas")
+    gifdecoder.drawMaterial = material.create("UnlitGeneric")
+    gifdecoder.drawMaterial:setTextureRenderTarget("$basetexture", "gif")
+    
+    function gifdecoder:initialize(data)
+        local ss = bit.stringstream()
+        for i=1, #data, 1000 do
+            ss:write(string.sub(data, i, math.min(i+1000-1, #data)))
+            coroutine.yield()
+        end
+        ss:seek(1)
+    
+        local header = ss:read(13)
+        local fdsz = string.byte(header, 11, 11)
+        if bit.band(fdsz, 0x80) ~= 0 then
+            local gtcsize = bit.lshift(1, bit.band(fdsz, 0x07) + 1)
+            header = header .. ss:read(gtcsize * 3)
+        end
+    
+        local headerss = bit.stringstream(header)
+        headerss:skip(6)
+        self.w = headerss:readUInt16()
+        self.h = headerss:readUInt16()
+        local maxs = math.max(self.w, self.h)
+        if maxs>1022 then
+            local scale = 1022 / maxs
+            self.w = self.w * scale
+            self.h = self.h * scale
+        end
+    
+        local imgs = {}
+        local curimg = imgStruct(header)
+        while ss:tell() <= ss:size() do
+            local com = ss:readUInt8()
+            if com == 0x21 then -- Extension control
+                local t = ss:readUInt8()
+                if t==0xF9 then -- Extension type
+                    ss:skip(1)
+                    local info = ss:read(4)
+                    ss:skip(1)
+                    curimg.data[#curimg.data + 1] = '\x21\xF9\x04' .. info .. '\x00'
+    
+                    local infoss = bit.stringstream(info)
+                    local rdit = infoss:readUInt8()
+                    curimg.delay = infoss:readUInt16()/100
+                    curimg.transparencyi = infoss:readUInt8()
+                    curimg.disposal = bit.band(bit.rshift(rdit, 2), 3)
+                    curimg.transparency = bit.band(rdit, 1)
+                else
+                    ignoreBlock(ss)
+                end
+            elseif com == 0x2C then -- Image
+                curimg.data[#curimg.data + 1] = '\x2C'
+                readImg(ss, curimg.data)
+                curimg.data[#curimg.data + 1] = '\x3B'
+                curimg.data = "data:image/gif;base64," ..http.base64Encode(table.concat(curimg.data))
+                imgs[#imgs+1] = curimg
+                curimg = imgStruct(header)
+            elseif com == 0x3B then break end -- File terminator
+            coroutine.yield()
+        end
+        self.imgs = imgs
+    end
+    
+    function gifdecoder:createSpriteSheet(maxRTs, doneCb)
+        local spritesheet = spritesheet:new(maxRTs, self.w, self.h, #self.imgs)
+        local totaldelay = 0
+        for i, img in ipairs(self.imgs) do
+            local frame = spritesheet.frames[i]
+            frame.delay = img.delay
+            totaldelay = totaldelay + img.delay
+            self:renderImg(img, frame, i)
+        end
+        spritesheet.totaldelay = totaldelay
+        return spritesheet
+    end
+    
+    function gifdecoder:renderImg(img, frame, i)
+        local done = false
+        gifdecoder.drawMaterial:setTextureURL("$basetexture", img.data, function(_,_,_,_,layout)
+            if layout==nil then error("Failed to decode gif") end
+            layout(1, 1, self.w, self.h)
+        end, function() done = true end)
+        while not done do coroutine.yield("wait") end
+    
+        done = false
+        hook.add("renderoffscreen","gifspritesheet",function()
+            render.selectRenderTarget("gifcanvas")
+            if first then render.clear(Color(0,0,0,0),true) end
+            render.setMaterial(gifdecoder.drawMaterial)
+            render.drawTexturedRectUV(1, 1, self.w, self.h, 1/1024, 1/1024, (1+self.w)/1024, (1+self.h)/1024)
+            
+            render.selectRenderTarget(frame.rt)
+            render.setRenderTargetTexture("gifcanvas")
+            render.drawTexturedRectUV(frame.x, frame.y, frame.w, frame.h, 1/1024, 1/1024, (1+self.w)/1024, (1+self.h)/1024)
+            if img.disposal==2 then render.selectRenderTarget("gifcanvas") render.clear(Color(0,0,0,0),true) end
+            
+            done = true
+            hook.remove("renderoffscreen","gifspritesheet")
+        end)
+    
+        while not done do coroutine.yield("wait") end
+    end
+    
+    function gifdecoder:getsize()
+        return self.w, self.h
+    end
+    
+    -------------------------------------------------
+    
+    local rtIndex = 0
+    function spritesheet:initialize(maxRTs, w, h, nframes)
+        self.t = 0
+        self.frames = {}
+        self.framew = w
+        self.frameh = h
+        self.framei = 1
+        for _, scale in ipairs{1, 0.75, 0.5, 0.25, 0.125, 0.0625} do
+            local w = w*scale
+            local h = h*scale
+            if w>1022 or h>1022 then continue end
+            local nx = math.floor(1023 / (w+1))
+            local ny = math.floor(1023 / (h+1))
+            if nx*ny*maxRTs < nframes then continue end
+            local nrt = math.ceil(nframes / (nx*ny))
+            -- Found a size that fits
+            self.framew = w
+            self.frameh = h
+            for i=1, nrt do
+                local rt = "gifrt"..rtIndex
+                render.createRenderTarget(rt)
+                rtIndex = rtIndex + 1
+                for x=1, nx*(w+1), (w+1) do
+                    for y=1, ny*(h+1), (h+1) do
+                        self.frames[#self.frames+1] = {rt = rt, x = x, y = y, w = w, h = h, u1 = x/1024, v1 = y/1024, u2 = (x+w)/1024, v2 = (y+h)/1024}
+                        if #self.frames == nframes then --[[printTable(self.frames)]] return end
+                    end
+                end
+            end
+        end
+        error("Failed to fit the gif into " .. maxRTs .. " rendertargets.")
+    end
+    
+    function spritesheet:getFrame(dt)
+        self.t = self.t + (dt % self.totaldelay)
+        local frame = self.frames[self.framei]
+        while self.t > frame.delay do
+            self.t = self.t - frame.delay
+            self.framei = (self.framei % #self.frames) + 1
+            frame = self.frames[self.framei]
+        end
+        return frame
+    end
+    
+    -------------------------------------------------
+    
+    local queue = {}
+    local function gifToSpritesheet(data, maxRTs, doneCb)
+        local worker = function()
+            --[[while not http.canRequest() do coroutine.yield("wait") end
+            local data
+            http.get("http://dl.dropboxusercontent.com/s/n1tezz2703mgaog/glaceon.gif", function(data_)
+                data = data_
+            end, error)
+            while not data do coroutine.yield("wait") end]]
+    
+            local decoder = gifdecoder:new(data)
+            doneCb(decoder:createSpriteSheet(maxRTs), decoder.w, decoder.h)
+            if #queue>0 then addWorker(table.remove(queue, 1)) end
+    
+            return "done"
+        end
+        if #workers>0 then queue[#queue+1] = worker else addWorker(worker) end
+    end
+    
+    -------------------------------------------------
+    
+    local sprayHolo
+    local sprayMat = material.create("VertexLitGeneric")
+    render.createRenderTarget("sheet_color")
+    sprayMat:setTextureRenderTarget("$basetexture", "sheet_color")
+    if (mode == 0) then sprayMat:setInt("$flags", 256) end
+    
+    function getWidthAndHeight(w, h)
+        local newW, newH = 0, 0
+        if w > h then
+            newW = 1024
+            newH = h * 1024 / w
+        else
+            newH = 1024
+            newW = w * 1024 / h
+        end
+        return newW,  newH   
+    end
+    
+    http.get(gifURL,function(data)
+    gifToSpritesheet(data, 40, function(spritesheet, w, h)
+        print("ready!")
+        local newW, newH = getWidthAndHeight(w, h)
+
+            hook.add("renderoffscreen","",function()
+                local frame = spritesheet:getFrame(timer.frametime())
+                local frameRt = frame.rt
+
+                render.selectRenderTarget("sheet_color")
+                render.clear(Color(0,0,0,0))
+                render.setRenderTargetTexture(frameRt)
+                render.drawTexturedRectUV(512-newW/2, 512-newH/2, newW, newH, frame.u1, frame.v1, frame.u2, frame.v2)
+             end)
+         end)  
+     end)
+    
+    local sprayIncrPressed = false
+    local sprayDecrPressed = false
+    timer.create("spraySize", 0.1, 0, function()
+        if sprayIncrPressed then
+            spraySize = spraySize + dSize
+        end
+        if sprayDecrPressed and spraySize - dSize > sprayMinSize then
+            spraySize = spraySize - dSize
+        end
+        net.start("resetSize")
+        timer.start("spraySize")
+        net.writeInt(spraySize, 16)
+        net.send()
+    end)
+    timer.stop("spraySize")
+    
+    if player()==owner() then
+        hook.add("inputPressed","",function(key)
+            if key==18 then
+                local tr = owner():getEyeTrace()
+                local pos = tr.HitPos
+                local normal = tr.HitNormal
+                local up
+                if normal==Vector(0,0,1) then
+                    up = Vector(0,1,0)
+                else
+                    up = (Vector(0,0,1) - normal*normal[3]):getNormalized()
+                end
+                local mat = Matrix()
+                mat:setForward(-up)
+                mat:setRight(normal:cross(up))
+                mat:setUp(normal)
+                mat:setTranslation(pos+normal)
+
+                net.start("spray")
+                net.writeMatrix(mat)
+                net.send()
+            end
+            
+            if key==88 then
+                sprayIncrPressed = true
+                spraySize = spraySize + dSize
+                net.start("resetSize")
+                timer.start("spraySize")
+                net.writeInt(spraySize, 16)
+                net.send()
+                timer.start("spraySize")
+            elseif key==90 then
+                sprayDecrPressed = true
+                if spraySize - dSize > sprayMinSize then
+                    spraySize = spraySize - dSize
+                    net.start("resetSize")
+                    timer.start("spraySize")
+                    net.writeInt(spraySize, 16)
+                    net.send()
+                end
+                timer.start("spraySize")
+            end
+        end)
+        
+        hook.add("inputReleased", "", function(key)
+            if key==88 then
+                sprayIncrPressed = false
+            end
+            
+            if key==90 then
+                sprayDecrPressed = false
+            end
+            
+            if not sprayIncrPressed and not sprayDecrPressed then
+                timer.stop("spraySize")
+            end
+        end)
+        
+    end
+
+    net.receive("holo",function()
+        net.readEntity(function(holo)
+            sprayHolo = holo
+            sprayHolo.setMaterial(sprayHolo, "!"..sprayMat:getName())
+        end)
+    end)
+
+    net.start("getholo") net.send()
+
+end

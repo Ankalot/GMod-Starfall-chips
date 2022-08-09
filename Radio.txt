@@ -1,0 +1,84 @@
+--@name Radio
+--@author Sparky & Ankalot
+--@shared
+--@model models/props_lab/citizenradio.mdl
+
+-- Made by Sparky
+-- Upgraded by Ankalot
+
+--Place this chip and type in chat "!song <url to music mp3>" and it'll play that music
+--Change volume: "!volume <url to music mp3>"
+--You can set songs multiple times
+
+local ownerOnly = false
+
+if SERVER then 
+    local currSongName = ""
+    local currVolume = 10
+    
+    hook.add("PlayerSay","Hey",function(ply,txt)
+        if (not ownerOnly or ply == owner()) and txt:sub(1,6)=="!song " then
+            currSongName = txt:sub(7)
+            net.start("playSong")
+            net.writeString(currSongName)
+            net.send()
+            
+            return ""
+        end
+        
+        if (not ownerOnly or ply == owner()) and txt:sub(1,8)=="!volume " then
+            local volume = tonumber(txt:sub(9))
+            if (volume != nil) and (volume > 0) and (volume < 1000) then
+                currVolume = volume
+                net.start("changeVolume")
+                net.writeInt(volume, 16)
+                print("volume changed")
+                net.send()
+            end
+            
+            return ""
+        end
+    end)
+    
+    hook.add("ClientInitialized","", function(pl)
+        net.start("playSong")
+        net.writeString(currSongName)
+        net.send(pl)
+        net.start("changeVolume")
+        net.writeInt(currVolume, 16)
+        net.send(pl)
+    end)
+else
+    local song
+    local volume
+    
+    hook.add("net","songs",function(name, len, pl)
+        if name=="playSong" then
+            if song and isValid(song) then song:stop() end
+            local songName = net.readString()
+            hook.remove("think","snd")
+            if not hasPermission("bass.loadURL", songName) then
+                print("whitelist error")
+                return
+            end
+            bass.loadURL(songName,"3d noblock", function(snd, err, errtxt)
+                if snd then
+                    print("song changed")
+                    song = snd
+                    snd:setVolume(volume)
+                    snd:setFade(500,10000)
+                    pcall(snd.setLooping, snd, true)
+                    hook.add("think","snd",function()
+                        song:setPos(chip():getPos())
+                    end)
+                else
+                    print(errtxt)
+                end
+            end)
+            
+        elseif name=="changeVolume" then
+            volume = net.readInt(16)
+            if song and isValid(song) then song:setVolume(volume) end
+        end
+    end)
+end
